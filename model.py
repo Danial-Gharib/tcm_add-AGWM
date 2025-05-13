@@ -4,6 +4,9 @@ import fairseq
 from conformer import ConformerBlock
 from torch.nn.modules.transformer import _get_clones
 from torch import Tensor
+from blo import *
+from utils import load_blo_weights_from_ssl, replace_linear_with_blo
+import copy
 
 def sinusoidal_embedding(n_channels, dim):
     pe = torch.FloatTensor([[p / (10000 ** (2 * (i // 2) / dim)) for i in range(dim)]
@@ -39,14 +42,18 @@ class MyConformer(nn.Module):
     return out, list_attn_weight
 
 class SSLModel(nn.Module): #W2V
-    def __init__(self,device):
+    def __init__(self,device, use_blo=False):
         super(SSLModel, self).__init__()
         cp_path = 'xlsr2_300m.pt'   # Change the pre-trained XLSR model path. 
         model, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([cp_path])
         self.model = model[0]
         self.device=device
         self.out_dim = 1024
-        return
+        if use_blo:
+            print("[INFO] Applying BLO to Wav2Vec2 linear layers...")
+            replace_linear_with_blo(self.model)
+        else:
+            print("[INFO] Using standard Wav2Vec2 without BLO.")
 
     def extract_feat(self, input_data):
         # put the model to GPU if it not there
@@ -72,8 +79,9 @@ class Model(nn.Module):
         ####
         # create network wav2vec 2.0
         ####
-        self.ssl_model = SSLModel(self.device)
-        self.LL = nn.Linear(1024, args.emb_size)
+        self.ssl_model = SSLModel(device, use_blo=args.use_blo)
+        # self.LL = nn.Linear(1024, args.emb_size)
+        self.LL = blo_linear(1024, args.emb_size) if args.use_blo else nn.Linear(1024, args.emb_size)
         print('W2V + Conformer')
         self.first_bn = nn.BatchNorm2d(num_features=1)
         self.selu = nn.SELU(inplace=True)

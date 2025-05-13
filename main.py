@@ -10,6 +10,11 @@ from utils import reproducibility
 from utils import read_metadata
 import numpy as np
 from tqdm import tqdm
+from betty.engine import Engine
+from betty.configs import Config, EngineConfig
+from betty.problems import ImplicitProblem
+
+
 
 def evaluate_accuracy(dev_loader, model, device):
     val_loss = 0.0
@@ -198,6 +203,14 @@ if __name__ == '__main__':
     parser.add_argument('--SNRmax', type=int, default=40, 
                     help='Maximum SNR value for coloured additive noise.[defaul=40]')
     
+
+    ############## args for BLO ########
+    parser.add_argument('--use_blo', default=False, type=lambda x: str(x).lower() in ['true','1','yes'],
+                    help='Whether to use blo_linear or not')
+    parser.add_argument('--alpha_lr', type=float, default=1e-3, help='Learning rate for BLO alphas')
+    parser.add_argument('--L1factor', type=float, default=0.01, help='L1 regularization for alpha in BLO')
+    
+    
     ##===================================================Rawboost data augmentation ======================================================================#
     
 
@@ -250,8 +263,33 @@ if __name__ == '__main__':
     print('nb_params:',nb_params)
 
     #set Adam optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
-     
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
+    
+    if args.use_blo:
+        architect = ["alpha", "pretrained_layer"]
+        no_decay = ["bias", "LayerNorm.weight"]
+
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters()
+                        if not any(nd in n for nd in no_decay) and not any(atn in n for atn in architect)],
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters()
+                        if any(nd in n for nd in no_decay) and not any(atn in n for atn in architect)],
+                "weight_decay": 0.0,
+            },
+        ]
+
+        alpha_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if "alpha" in n],
+                "weight_decay": args.weight_decay,
+            }
+        ]
+
+
     # define train dataloader
     label_trn, files_id_train = read_metadata( dir_meta =  os.path.join(args.protocols_path+'LA/{}_cm_protocols/{}.cm.train.trn.txt'.format(prefix,prefix_2019)), is_eval=False)
     print('no. of training trials',len(files_id_train))
@@ -272,43 +310,140 @@ if __name__ == '__main__':
     dev_loader = DataLoader(dev_set, batch_size=8, num_workers=10, shuffle=False)
     del dev_set,labels_dev
 
-    
-    ##################### Training and validation #####################
-    num_epochs = args.num_epochs
-    not_improving=0
-    epoch=0
-    bests=np.ones(n_mejores,dtype=float)*float('inf')
-    best_loss=float('inf')
-    if args.train:
-        for i in range(n_mejores):
-            np.savetxt( os.path.join(best_save_path, 'best_{}.pth'.format(i)), np.array((0,0)))
-        while not_improving<args.num_epochs:
-            print('######## Epoca {} ########'.format(epoch))
-            train_epoch(train_loader, model, args.lr, optimizer, device)
-            val_loss = evaluate_accuracy(dev_loader, model, device)
-            if val_loss<best_loss:
-                best_loss=val_loss
-                torch.save(model.state_dict(), os.path.join(model_save_path, 'best.pth'))
-                print('New best epoch')
-                not_improving=0
-            else:
-                not_improving+=1
-            for i in range(n_mejores):
-                if bests[i]>val_loss:
-                    for t in range(n_mejores-1,i,-1):
-                        bests[t]=bests[t-1]
-                        os.system('mv {}/best_{}.pth {}/best_{}.pth'.format(best_save_path, t-1, best_save_path, t))
-                    bests[i]=val_loss
-                    torch.save(model.state_dict(), os.path.join(best_save_path, 'best_{}.pth'.format(i)))
-                    break
-            print('\n{} - {}'.format(epoch, val_loss))
-            print('n-best loss:', bests)
-            #torch.save(model.state_dict(), os.path.join(model_save_path, 'epoch_{}.pth'.format(epoch)))
-            epoch+=1
-            if epoch>74:
-                break
-        print('Total epochs: ' + str(epoch) +'\n')
+    if args.use_blo:
+        inner_loader = train_loader  
+        outer_loader = dev_loader    
 
+    #############################
+    train_avg_loss = torch.zeros(10)
+    val_avg_loss = torch.zeros(10)
+
+    def normalize_alphas(params):
+        for p in params:
+            with torch.no_grad():
+                p.clamp_(0, 1)
+
+    class Outer(ImplicitProblem):
+        def forward(self, inputs):
+            return self.module(**inputs)
+
+        def training_step(self, inputs):
+            normalize_alphas(self.trainable_parameters())
+
+            outputs = self.inner(inputs)
+            loss = outputs.loss
+
+            # Optionally add L1 regularization on alphas
+            if args.use_blo and hasattr(args, 'L1factor'):
+                reg_loss = sum(torch.norm(p, 1) / p.numel() for p in self.trainable_parameters())
+                loss = loss + args.L1factor * reg_loss
+
+            return loss
+
+        def trainable_parameters(self):
+            return [p for n, p in self.module.named_parameters() if "alpha" in n]
+
+        def param_groups(self):
+            return alpha_grouped_parameters
+
+    class Inner(ImplicitProblem):
+        def forward(self, inputs):
+            return self.module(**inputs)
+
+        def training_step(self, inputs):
+            normalize_alphas(self.outer.trainable_parameters())
+
+            outputs = self.outer(inputs)
+            return outputs.loss
+
+        def trainable_parameters(self):
+            return [p for n, p in self.module.named_parameters() if not any(x in n for x in ['alpha', 'pretrained_layer'])]
+
+        def param_groups(self):
+            return optimizer_grouped_parameters
+
+    ##########################
+    if args.use_blo:
+        optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.lr)
+        alpha_optimizer = torch.optim.Adam(alpha_grouped_parameters, lr=args.alpha_lr)
+
+        outer = Outer(
+            name="outer",
+            module=model,
+            optimizer=alpha_optimizer,
+            train_data_loader=outer_loader,
+            device=device,
+            config=Config(type='darts', retain_graph=True, first_order=True)
+        )
+
+        inner = Inner(
+            name="inner",
+            module=model,
+            optimizer=optimizer,
+            train_data_loader=inner_loader,
+            device=device,
+            config=Config(type='darts', unroll_steps=1)
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
+    
+    ####
+    if args.use_blo:
+        dependencies = {
+            "l2u": {inner: [outer]},
+            "u2l": {outer: [inner]},
+        }
+
+        engine = Engine(
+            problems=[outer, inner],
+            dependencies=dependencies,
+            config=EngineConfig(
+                train_iters=args.num_epochs * len(inner_loader),
+                valid_step=100,  
+                logger_type='tensorboard',
+            )
+        )
+
+        # Run MLO training
+        engine.run()
+    else:
+    ##################### Training and validation #####################
+        num_epochs = args.num_epochs
+        not_improving=0
+        epoch=0
+        bests=np.ones(n_mejores,dtype=float)*float('inf')
+        best_loss=float('inf')
+        if args.train:
+            for i in range(n_mejores):
+                np.savetxt( os.path.join(best_save_path, 'best_{}.pth'.format(i)), np.array((0,0)))
+            while not_improving<args.num_epochs:
+                print('######## Epoca {} ########'.format(epoch))
+                train_epoch(train_loader, model, args.lr, optimizer, device)
+                val_loss = evaluate_accuracy(dev_loader, model, device)
+                if val_loss<best_loss:
+                    best_loss=val_loss
+                    torch.save(model.state_dict(), os.path.join(model_save_path, 'best.pth'))
+                    print('New best epoch')
+                    not_improving=0
+                else:
+                    not_improving+=1
+                for i in range(n_mejores):
+                    if bests[i]>val_loss:
+                        for t in range(n_mejores-1,i,-1):
+                            bests[t]=bests[t-1]
+                            os.system('mv {}/best_{}.pth {}/best_{}.pth'.format(best_save_path, t-1, best_save_path, t))
+                        bests[i]=val_loss
+                        torch.save(model.state_dict(), os.path.join(best_save_path, 'best_{}.pth'.format(i)))
+                        break
+                print('\n{} - {}'.format(epoch, val_loss))
+                print('n-best loss:', bests)
+                #torch.save(model.state_dict(), os.path.join(model_save_path, 'epoch_{}.pth'.format(epoch)))
+                epoch+=1
+                if epoch>74:
+                    break
+            print('Total epochs: ' + str(epoch) +'\n')
+
+    ##############################################################
 
     print('######## Eval ########')
     if args.average_model:

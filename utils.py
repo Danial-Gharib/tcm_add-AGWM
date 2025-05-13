@@ -5,6 +5,10 @@ import torch
 import importlib
 import random
 
+import torch.nn as nn
+from blo import *
+import re
+
 def pad(x, max_len):
     x_len = x.shape[0]
     if x_len >= max_len:
@@ -53,3 +57,28 @@ def my_collate(batch): #Dataset return sample = (utterance, target, nameFile) #s
   label = [dp[1] for dp in batch]
   nameFile = [dp[2] for dp in batch]
   return (data, label, nameFile) 
+
+
+
+def replace_linear_with_blo(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            in_features = child.in_features
+            out_features = child.out_features
+            bias = child.bias is not None
+
+            blo_layer = blo_linear(in_features, out_features, bias=bias)
+
+            blo_layer.linear_layer.weight.data.copy_(child.weight.data)
+            blo_layer.pretrained_layer.weight.data.copy_(child.weight.data)
+            blo_layer.pretrained_layer.requires_grad_(False)
+
+            if bias:
+                blo_layer.linear_layer.bias.data.copy_(child.bias.data)
+                blo_layer.pretrained_layer.bias.data.copy_(child.bias.data)
+                blo_layer.pretrained_layer.bias.requires_grad = False
+
+            setattr(module, name, blo_layer)
+        else:
+            replace_linear_with_blo(child)
+
