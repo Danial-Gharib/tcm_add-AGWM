@@ -49,11 +49,6 @@ class SSLModel(nn.Module): #W2V
         self.model = model[0]
         self.device=device
         self.out_dim = 1024
-        if use_blo:
-            print("[INFO] Applying BLO to Wav2Vec2 linear layers...")
-            replace_linear_with_blo(self.model)
-        else:
-            print("[INFO] Using standard Wav2Vec2 without BLO.")
 
     def extract_feat(self, input_data):
         # put the model to GPU if it not there
@@ -81,7 +76,7 @@ class Model(nn.Module):
         ####
         self.ssl_model = SSLModel(device, use_blo=args.use_blo)
         # self.LL = nn.Linear(1024, args.emb_size)
-        self.LL = blo_linear(1024, args.emb_size) if args.use_blo else nn.Linear(1024, args.emb_size)
+        self.LL = nn.Linear(1024, args.emb_size)
         print('W2V + Conformer')
         self.first_bn = nn.BatchNorm2d(num_features=1)
         self.selu = nn.SELU(inplace=True)

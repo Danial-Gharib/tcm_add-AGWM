@@ -58,6 +58,9 @@ def my_collate(batch): #Dataset return sample = (utterance, target, nameFile) #s
   nameFile = [dp[2] for dp in batch]
   return (data, label, nameFile) 
 
+def inject_blo_into_ssl(model):
+    print("[INFO] Injecting BLO into ssl_model layers only...")
+    replace_linear_with_blo(model.ssl_model.model)
 
 
 def replace_linear_with_blo(module):

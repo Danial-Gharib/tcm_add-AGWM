@@ -8,11 +8,11 @@ from data_utils import Dataset_train, Dataset_eval
 from model import Model
 from utils import reproducibility
 from utils import read_metadata
+from utils import inject_blo_into_ssl
 import numpy as np
 from tqdm import tqdm
-from betty.engine import Engine
-from betty.configs import Config, EngineConfig
-from betty.problems import ImplicitProblem
+from copy import deepcopy
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 
 
@@ -72,6 +72,70 @@ def produce_evaluation_file(dataset, model, device, save_path):
     del text_list
     fh.close()
     print('Scores saved to {}'.format(save_path))
+
+def train_epoch_bilevel(train_loader, val_loader, model, inner_optimizer, outer_optimizer, device, args):
+    model.train()
+    weight = torch.FloatTensor([0.1, 0.9]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weight)
+    pbar = tqdm(train_loader, desc="Bi-Level Training")
+
+    val_iter = iter(val_loader)
+
+    for batch_idx, (x_train, y_train) in enumerate(pbar):
+        x_train = x_train.to(device)
+        y_train = y_train.view(-1).type(torch.int64).to(device)
+
+        # Step 1: Clone model
+        unrolled_model = deepcopy(model)
+        unrolled_model.to(device)
+
+        # Step 2: Compute training loss and inner gradients
+        output_train, _ = unrolled_model(x_train)
+        loss_train = criterion(output_train, y_train)
+        theta = [p for n, p in unrolled_model.named_parameters() if "alpha" not in n and "pretrained_layer" not in n]
+        grad_theta = torch.autograd.grad(loss_train, theta, create_graph=True)
+
+        theta_vector = parameters_to_vector(theta)
+        grad_vector = parameters_to_vector(grad_theta)
+        theta_updated = theta_vector - args.lr * grad_vector
+        vector_to_parameters(theta_updated, theta)
+
+        # Step 3: Outer loss and alpha update
+        try:
+            x_val, y_val = next(val_iter)
+        except StopIteration:
+            val_iter = iter(val_loader)
+            x_val, y_val = next(val_iter)
+
+        x_val = x_val.to(device)
+        y_val = y_val.view(-1).type(torch.int64).to(device)
+
+        output_val, _ = unrolled_model(x_val)
+        loss_val = criterion(output_val, y_val)
+
+        outer_optimizer.zero_grad()
+        loss_val.backward()
+        outer_optimizer.step()
+
+        # Clamp alphas between [0, 1]
+        for name, p in model.named_parameters():
+            if "alpha" in name:
+                p.data.clamp_(0, 1)
+
+        # Step 4: Real model update (θ)
+        output_train_real, _ = model(x_train)
+        loss_real = criterion(output_train_real, y_train)
+
+        if args.L1factor > 0:
+            reg_loss = sum(torch.norm(p, 1) / p.numel() for n, p in model.named_parameters() if "alpha" in n)
+            loss_real += args.L1factor * reg_loss
+
+        inner_optimizer.zero_grad()
+        loss_real.backward()
+        inner_optimizer.step()
+
+        pbar.set_description(f"Train Loss={loss_real.item():.4f}, Val Loss={loss_val.item():.4f}")
+
 
 def train_epoch(train_loader, model, lr,optim, device):
     num_total = 0.0
@@ -258,6 +322,9 @@ if __name__ == '__main__':
     if not args.FT_W2V:
         for param in model.ssl_model.parameters():
             param.requires_grad = False
+    
+    if args.use_blo:
+        inject_blo_into_ssl(model)
     nb_params = sum([param.view(-1).size()[0] for param in model.parameters() if param.requires_grad])
     model =model.to(device)
     print('nb_params:',nb_params)
@@ -266,30 +333,14 @@ if __name__ == '__main__':
     # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
     
     if args.use_blo:
-        architect = ["alpha", "pretrained_layer"]
-        no_decay = ["bias", "LayerNorm.weight"]
+        alpha_params = [p for n, p in model.named_parameters() if "alpha" in n]
+        alpha_optimizer = torch.optim.Adam(alpha_params, lr=args.alpha_lr)
 
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters()
-                        if not any(nd in n for nd in no_decay) and not any(atn in n for atn in architect)],
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "params": [p for n, p in model.named_parameters()
-                        if any(nd in n for nd in no_decay) and not any(atn in n for atn in architect)],
-                "weight_decay": 0.0,
-            },
-        ]
-
-        alpha_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters() if "alpha" in n],
-                "weight_decay": args.weight_decay,
-            }
-        ]
-
-
+        # For all other parameters
+        non_alpha_params = [p for n, p in model.named_parameters() if "alpha" not in n and "pretrained_layer" not in n]
+        optimizer = torch.optim.Adam(non_alpha_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
     # define train dataloader
     label_trn, files_id_train = read_metadata( dir_meta =  os.path.join(args.protocols_path+'LA/{}_cm_protocols/{}.cm.train.trn.txt'.format(prefix,prefix_2019)), is_eval=False)
     print('no. of training trials',len(files_id_train))
@@ -310,102 +361,38 @@ if __name__ == '__main__':
     dev_loader = DataLoader(dev_set, batch_size=8, num_workers=10, shuffle=False)
     del dev_set,labels_dev
 
-    if args.use_blo:
-        inner_loader = train_loader  
-        outer_loader = dev_loader    
-
-    #############################
-    train_avg_loss = torch.zeros(10)
-    val_avg_loss = torch.zeros(10)
-
-    def normalize_alphas(params):
-        for p in params:
-            with torch.no_grad():
-                p.clamp_(0, 1)
-
-    class Outer(ImplicitProblem):
-        def forward(self, inputs):
-            return self.module(**inputs)
-
-        def training_step(self, inputs):
-            normalize_alphas(self.trainable_parameters())
-
-            outputs = self.inner(inputs)
-            loss = outputs.loss
-
-            # Optionally add L1 regularization on alphas
-            if args.use_blo and hasattr(args, 'L1factor'):
-                reg_loss = sum(torch.norm(p, 1) / p.numel() for p in self.trainable_parameters())
-                loss = loss + args.L1factor * reg_loss
-
-            return loss
-
-        def trainable_parameters(self):
-            return [p for n, p in self.module.named_parameters() if "alpha" in n]
-
-        def param_groups(self):
-            return alpha_grouped_parameters
-
-    class Inner(ImplicitProblem):
-        def forward(self, inputs):
-            return self.module(**inputs)
-
-        def training_step(self, inputs):
-            normalize_alphas(self.outer.trainable_parameters())
-
-            outputs = self.outer(inputs)
-            return outputs.loss
-
-        def trainable_parameters(self):
-            return [p for n, p in self.module.named_parameters() if not any(x in n for x in ['alpha', 'pretrained_layer'])]
-
-        def param_groups(self):
-            return optimizer_grouped_parameters
-
     ##########################
     if args.use_blo:
-        optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.lr)
-        alpha_optimizer = torch.optim.Adam(alpha_grouped_parameters, lr=args.alpha_lr)
+        bests = np.ones(n_mejores, dtype=float) * float('inf')
+        best_loss = float('inf')
+        epoch = 0
+        not_improving = 0
+        while not_improving < args.num_epochs:
+            print(f"######## Epoch {epoch} ########")
+            train_epoch_bilevel(train_loader, dev_loader, model, optimizer, alpha_optimizer, device, args)
 
-        outer = Outer(
-            name="outer",
-            module=model,
-            optimizer=alpha_optimizer,
-            train_data_loader=outer_loader,
-            device=device,
-            config=Config(type='darts', retain_graph=True, first_order=True)
-        )
+            val_loss = evaluate_accuracy(dev_loader, model, device)
 
-        inner = Inner(
-            name="inner",
-            module=model,
-            optimizer=optimizer,
-            train_data_loader=inner_loader,
-            device=device,
-            config=Config(type='darts', unroll_steps=1)
-        )
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,weight_decay=args.weight_decay)
-    
-    ####
-    if args.use_blo:
-        dependencies = {
-            "l2u": {inner: [outer]},
-            "u2l": {outer: [inner]},
-        }
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(model_save_path, 'best.pth'))
+                print("New best epoch")
+                not_improving = 0
+            else:
+                not_improving += 1
 
-        engine = Engine(
-            problems=[outer, inner],
-            dependencies=dependencies,
-            config=EngineConfig(
-                train_iters=args.num_epochs * len(inner_loader),
-                valid_step=100,  
-                logger_type='tensorboard',
-            )
-        )
+            for i in range(n_mejores):
+                if bests[i] > val_loss:
+                    for t in range(n_mejores-1, i, -1):
+                        bests[t] = bests[t-1]
+                        os.system(f'mv {best_save_path}/best_{t-1}.pth {best_save_path}/best_{t}.pth')
+                    bests[i] = val_loss
+                    torch.save(model.state_dict(), os.path.join(best_save_path, f'best_{i}.pth'))
+                    break
 
-        # Run MLO training
-        engine.run()
+            print(f"{epoch} - {val_loss}")
+            print("n-best loss:", bests)
+            epoch += 1
     else:
     ##################### Training and validation #####################
         num_epochs = args.num_epochs
